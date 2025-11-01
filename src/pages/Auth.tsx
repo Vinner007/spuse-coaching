@@ -1,384 +1,445 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { AuthLayout } from "@/components/AuthLayout";
+import { DashboardLayout } from "@/components/DashboardLayout";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Upload, FileCheck, Calendar, User, Download } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useToast } from "@/hooks/use-toast";
-import { z } from "zod";
+import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
-const loginSchema = z.object({
-  email: z.string().email("อีเมลไม่ถูกต้อง"),
-  password: z.string().min(6, "รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร"),
-});
-
-const registerSchema = loginSchema.extend({
-  firstName: z.string().min(1, "กรุณากรอกชื่อ"),
-  lastName: z.string().min(1, "กรุณากรอกนามสกุล"),
-  studentId: z.string().optional(),
-  groupId: z.string().optional(),
-  confirmPassword: z.string(),
-}).refine((data) => data.password === data.confirmPassword, {
-  message: "รหัสผ่านไม่ตรงกัน",
-  path: ["confirmPassword"],
-});
-
-export default function Auth() {
-  const [isLoading, setIsLoading] = useState(false);
+export default function Student() {
+  const [user, setUser] = useState<any>(null);
+  const [profile, setProfile] = useState<any>(null);
+  const [sessions, setSessions] = useState<any[]>([]);
+  const [requiredSessions, setRequiredSessions] = useState(10);
+  const [sessionNumber, setSessionNumber] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [selectedTeacher, setSelectedTeacher] = useState("");
+  const [selectedGroup, setSelectedGroup] = useState("");
+  const [teachers, setTeachers] = useState<any[]>([]);
+  const [groups, setGroups] = useState<any[]>([]);
+  const [teacherAssignments, setTeacherAssignments] = useState<any[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSavingProfile, setIsSavingProfile] = useState(false);
   const navigate = useNavigate();
   const { toast } = useToast();
 
-  const [loginData, setLoginData] = useState({ email: "", password: "" });
-  const [registerData, setRegisterData] = useState({
-    email: "",
-    password: "",
-    confirmPassword: "",
-    firstName: "",
-    lastName: "",
-    studentId: "",
-    groupId: "",
-  });
-  const [groups, setGroups] = useState<any[]>([]);
+  useEffect(() => {
+    checkAuth();
+  }, []);
 
-  const handleGoogleLogin = async () => {
+  useEffect(() => {
+    if (!user) return;
+    const channel = supabase
+      .channel("student-changes")
+      .on("postgres_changes", { event: "*", schema: "public", table: "coaching_sessions" }, () => {
+        if (user?.id) fetchData(user.id);
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "profiles" }, () => {
+        if (user?.id) fetchData(user.id);
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "teacher_assignments" }, () => {
+        if (user?.id) fetchData(user.id);
+      })
+      .on("postgres_changes", { event: "*", schema: "public", table: "student_groups" }, () => {
+        if (user?.id) fetchData(user.id);
+      })
+      .subscribe();
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [user]);
+
+  const checkAuth = async () => {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) {
+      navigate("/auth");
+      return;
+    }
+    const { data: roleData } = await supabase.from("user_roles").select("role").eq("user_id", session.user.id).single();
+    if (roleData?.role !== "student") {
+      navigate(`/${roleData?.role || "auth"}`);
+      return;
+    }
+    setUser(session.user);
+    fetchData(session.user.id);
+  };
+
+  const fetchData = async (userId: string) => {
     try {
-      const { error } = await supabase.auth.signInWithOAuth({
-        provider: "google",
-        options: {
-          redirectTo: `${window.location.origin}/`,
-          queryParams: {
-            access_type: 'offline',
-            prompt: 'select_account',
-          }
-        }
+      // First, get teacher user IDs
+      const { data: teacherRoles } = await supabase
+        .from("user_roles")
+        .select("user_id")
+        .eq("role", "teacher");
+
+      const teacherIds = teacherRoles?.map(r => r.user_id) || [];
+
+      // Then fetch all data
+      const [profileRes, sessionsRes, settingsRes, teachersRes, groupsRes, assignmentsRes] = await Promise.all([
+        supabase.from("profiles").select("*").eq("id", userId).single(),
+        supabase.from("coaching_sessions").select("*").eq("student_id", userId).order("created_at", { ascending: false }),
+        supabase.from("coaching_settings").select("*").eq("key", "min_sessions").single(),
+        teacherIds.length > 0 
+          ? supabase.from("profiles").select("id, first_name, last_name").in("id", teacherIds)
+          : Promise.resolve({ data: [] }),
+        supabase.from("student_groups").select("*").order("name"),
+        supabase.from("teacher_assignments").select("teacher_id, group_id, profiles!inner(first_name, last_name)"),
+      ]);
+
+      if (profileRes.data) {
+        setProfile(profileRes.data);
+        setSelectedGroup(profileRes.data.group_id || "");
+      }
+      if (sessionsRes.data) setSessions(sessionsRes.data);
+      if (settingsRes.data) setRequiredSessions(parseInt(settingsRes.data.value));
+      if (teachersRes.data) setTeachers(teachersRes.data);
+      if (groupsRes.data) setGroups(groupsRes.data);
+      if (assignmentsRes.data) setTeacherAssignments(assignmentsRes.data);
+    } catch (error: any) {
+      console.error("Error fetching data:", error);
+      toast({
+        variant: "destructive",
+        title: "เกิดข้อผิดพลาด",
+        description: error.message,
       });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleSaveGroup = async (groupId: string) => {
+    if (!user) return;
+    
+    setIsSavingProfile(true);
+    try {
+      const { error } = await supabase
+        .from("profiles")
+        .update({ group_id: groupId })
+        .eq("id", user.id);
 
       if (error) throw error;
+
+      // Add to group_members table
+      const { error: memberError } = await supabase
+        .from("group_members")
+        .upsert(
+          { student_id: user.id, group_id: groupId },
+          { onConflict: 'student_id', ignoreDuplicates: false }
+        );
+
+      if (memberError) {
+        console.error("Group member error:", memberError);
+      }
+
+      setSelectedGroup(groupId);
+      setProfile({ ...profile, group_id: groupId });
+
+      toast({
+        title: "บันทึกสำเร็จ",
+        description: "บันทึกกลุ่มเรียนของคุณแล้ว",
+      });
     } catch (error: any) {
       toast({
         variant: "destructive",
-        title: "ไม่สามารถเข้าสู่ระบบด้วย Google ได้",
+        title: "เกิดข้อผิดพลาด",
+        description: error.message,
+      });
+    } finally {
+      setIsSavingProfile(false);
+    }
+  };
+
+  const handleUploadSession = async () => {
+    if (!file || !sessionNumber || !user || !selectedTeacher) {
+      toast({
+        variant: "destructive",
+        title: "กรุณากรอกข้อมูลให้ครบถ้วน",
+        description: "กรุณาเลือกอาจารย์และหมายเลขครั้งที่",
+      });
+      return;
+    }
+
+    setIsUploading(true);
+    try {
+      const fileExt = file.name.split(".").pop();
+      const fileName = `${user.id}/${Date.now()}.${fileExt}`;
+      const { data: uploadData, error: uploadError } = await supabase.storage.from("coaching-forms").upload(fileName, file);
+
+      if (uploadError) throw uploadError;
+
+      const { error: insertError } = await supabase.from("coaching_sessions").insert({
+        student_id: user.id,
+        teacher_id: selectedTeacher,
+        group_id: selectedGroup || null,
+        session_number: parseInt(sessionNumber),
+        file_url: uploadData.path,
+        file_name: file.name,
+        status: "pending",
+      });
+
+      if (insertError) throw insertError;
+
+      toast({
+        title: "อัปโหลดสำเร็จ",
+        description: "ส่งใบ Coaching แล้ว (รอการยืนยันจากอาจารย์)",
+      });
+
+      setFile(null);
+      setSessionNumber("");
+      setSelectedTeacher("");
+      fetchData(user.id);
+    } catch (error: any) {
+      toast({
+        variant: "destructive",
+        title: "อัปโหลดล้มเหลว",
+        description: error.message,
+      });
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const viewFile = async (fileUrl: string) => {
+    try {
+      const { data, error } = await supabase.storage.from("coaching-forms").createSignedUrl(fileUrl, 60);
+      if (error) throw error;
+      if (data?.signedUrl) window.open(data.signedUrl, "_blank");
+    } catch (error: any) {
+      toast({
+        variant: "destructive",
+        title: "ไม่สามารถเปิดไฟล์ได้",
         description: error.message,
       });
     }
   };
 
-  useEffect(() => {
-    const fetchGroups = async () => {
-      const { data } = await supabase.from("student_groups").select("*");
-      if (data) setGroups(data);
+  const getStatusBadge = (status: string) => {
+    const badges = {
+      approved: <Badge className="bg-green-500"><FileCheck className="w-3 h-3 mr-1" />อนุมัติ</Badge>,
+      rejected: <Badge variant="destructive">ไม่อนุมัติ</Badge>,
+      pending: <Badge variant="secondary">รอยืนยัน</Badge>,
     };
-    fetchGroups();
-  }, []);
-
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsLoading(true);
-
-    try {
-      loginSchema.parse(loginData);
-
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email: loginData.email,
-        password: loginData.password,
-      });
-
-      if (error) throw error;
-
-      toast({
-        title: "เข้าสู่ระบบสำเร็จ",
-        description: "ยินดีต้อนรับกลับ",
-      });
-
-      // Redirect based on role
-      const { data: roleData } = await supabase
-        .from("user_roles")
-        .select("role")
-        .eq("user_id", data.user.id)
-        .single();
-
-      if (roleData?.role === "super_admin") {
-        navigate("/super-admin");
-      } else if (roleData?.role === "admin") {
-        navigate("/admin");
-      } else if (roleData?.role === "teacher") {
-        navigate("/teacher");
-      } else {
-        navigate("/student");
-      }
-    } catch (error: any) {
-      toast({
-        variant: "destructive",
-        title: "ไม่สามารถเข้าสู่ระบบได้",
-        description: error.message || "กรุณาตรวจสอบอีเมลและรหัสผ่าน",
-      });
-    } finally {
-      setIsLoading(false);
-    }
+    return badges[status as keyof typeof badges] || badges.pending;
   };
 
-  const handleRegister = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setIsLoading(true);
-
-    try {
-      registerSchema.parse(registerData);
-
-      // Validate email domain - เฉพาะนักศึกษาเท่านั้น
-      const isStudent = registerData.email.endsWith("@spumail.net");
-
-      if (!isStudent) {
-        throw new Error("สามารถลงทะเบียนได้เฉพาะนักศึกษา (@spumail.net) เท่านั้น อาจารย์และ Staff กรุณาติดต่อ Super Admin");
+  // ฟังก์ชันดึงชื่ออาจารย์ของกลุ่ม
+  const getGroupTeachers = (groupId: string) => {
+    const assignments = teacherAssignments.filter(a => a.group_id === groupId);
+    if (assignments.length === 0) return null;
+    
+    // ดึงชื่ออาจารย์จาก profiles ที่ join มาใน teacherAssignments
+    const teacherNames = assignments.map(a => {
+      if (a.profiles) {
+        return `${a.profiles.first_name} ${a.profiles.last_name}`;
       }
+      return null;
+    }).filter(Boolean);
 
-      if (!registerData.studentId || !registerData.groupId) {
-        throw new Error("กรุณากรอกรหัสนักศึกษาและเลือกกลุ่มเรียน");
-      }
-
-      const { data, error } = await supabase.auth.signUp({
-        email: registerData.email,
-        password: registerData.password,
-        options: {
-          emailRedirectTo: `${window.location.origin}/`,
-          data: {
-            first_name: registerData.firstName,
-            last_name: registerData.lastName,
-            student_id: registerData.studentId,
-            group_id: registerData.groupId,
-          },
-        },
-      });
-
-      if (error) throw error;
-
-      // Update profile with additional info
-      if (data.user) {
-        await supabase.from("profiles").update({
-          student_id: registerData.studentId,
-          group_id: registerData.groupId || null,
-        }).eq("id", data.user.id);
-      }
-
-      toast({
-        title: "ลงทะเบียนสำเร็จ",
-        description: "คุณสามารถเข้าสู่ระบบได้เลย",
-      });
-
-      // Switch to login tab
-      setLoginData({ email: registerData.email, password: "" });
-    } catch (error: any) {
-      toast({
-        variant: "destructive",
-        title: "ไม่สามารถลงทะเบียนได้",
-        description: error.message || "กรุณาลองใหม่อีกครั้ง",
-      });
-    } finally {
-      setIsLoading(false);
-    }
+    return teacherNames.length > 0 ? teacherNames.join(", ") : null;
   };
+
+  const completedSessions = sessions.filter((s) => s.status === "approved").length;
+  const progressPercentage = (completedSessions / requiredSessions) * 100;
+
+  // Show all teachers or filtered by group
+  const availableTeachers = selectedGroup
+    ? teachers.filter((teacher) => 
+        teacherAssignments.some(
+          (assignment) => assignment.teacher_id === teacher.id && assignment.group_id === selectedGroup
+        )
+      )
+    : teachers;
+
+  if (isLoading) return (
+    <DashboardLayout role="student" userName="">
+      <div className="flex items-center justify-center h-screen">
+        <p>กำลังโหลด...</p>
+      </div>
+    </DashboardLayout>
+  );
 
   return (
-    <AuthLayout
-      title="ระบบติดตามใบ Coaching"
-      subtitle="มหาวิทยาลัยศรีปทุม"
-    >
-      <Tabs defaultValue="login" className="w-full">
-        <TabsList className="grid w-full grid-cols-2 mb-6 bg-muted/50 backdrop-blur-sm p-1">
-          <TabsTrigger 
-            value="login" 
-            className="data-[state=active]:bg-card data-[state=active]:shadow-elegant transition-all duration-300"
-          >
-            เข้าสู่ระบบ
-          </TabsTrigger>
-          <TabsTrigger 
-            value="register"
-            className="data-[state=active]:bg-card data-[state=active]:shadow-elegant transition-all duration-300"
-          >
-            ลงทะเบียน
-          </TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="login" className="animate-fade-in-up">
-          <form onSubmit={handleLogin} className="space-y-4">
-            <Button
-              type="button"
-              variant="outline"
-              className="w-full gap-2 apple-button animate-stagger-1"
-              onClick={handleGoogleLogin}
-            >
-              <svg className="w-5 h-5" viewBox="0 0 24 24">
-                <path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-                <path fill="currentColor" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-                <path fill="currentColor" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
-                <path fill="currentColor" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
-              </svg>
-              เข้าสู่ระบบด้วย Google
-            </Button>
-
-            <div className="relative animate-stagger-2">
-              <div className="absolute inset-0 flex items-center">
-                <span className="w-full border-t border-border/50" />
+    <DashboardLayout role="student" userName={`${profile?.first_name} ${profile?.last_name}`}>
+      <div className="space-y-6 p-4 sm:p-6">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-xl sm:text-2xl">ข้อมูลส่วนตัว</CardTitle>
+            <CardDescription>เลือกกลุ่มเรียนของคุณ</CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <Label>ชื่อ-นามสกุล</Label>
+                <Input value={`${profile?.first_name} ${profile?.last_name}`} disabled className="bg-muted" />
               </div>
-              <div className="relative flex justify-center text-xs uppercase">
-                <span className="bg-card/80 backdrop-blur-sm px-3 py-1 rounded-full text-muted-foreground">หรือ</span>
+              <div>
+                <Label>รหัสนักศึกษา</Label>
+                <Input value={profile?.student_id || "-"} disabled className="bg-muted" />
               </div>
             </div>
-
-            <div className="space-y-2 animate-stagger-3">
-              <Label htmlFor="login-email" className="text-sm font-medium">อีเมล</Label>
-              <Input
-                id="login-email"
-                type="email"
-                placeholder="example@spumail.net"
-                value={loginData.email}
-                onChange={(e) => setLoginData({ ...loginData, email: e.target.value })}
-                className="apple-input"
-                required
-              />
-            </div>
-            <div className="space-y-2 animate-stagger-4">
-              <Label htmlFor="login-password" className="text-sm font-medium">รหัสผ่าน</Label>
-              <Input
-                id="login-password"
-                type="password"
-                value={loginData.password}
-                onChange={(e) => setLoginData({ ...loginData, password: e.target.value })}
-                className="apple-input"
-                required
-              />
-            </div>
-            <Button type="submit" className="w-full apple-button-primary animate-stagger-5" disabled={isLoading}>
-              {isLoading ? "กำลังเข้าสู่ระบบ..." : "เข้าสู่ระบบ"}
-            </Button>
-          </form>
-        </TabsContent>
-
-        <TabsContent value="register" className="animate-fade-in-up">
-          <form onSubmit={handleRegister} className="space-y-4">
-            <Button
-              type="button"
-              variant="outline"
-              className="w-full gap-2 apple-button animate-stagger-1"
-              onClick={handleGoogleLogin}
-            >
-              <svg className="w-5 h-5" viewBox="0 0 24 24">
-                <path fill="currentColor" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-                <path fill="currentColor" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-                <path fill="currentColor" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
-                <path fill="currentColor" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
-              </svg>
-              ลงทะเบียนด้วย Google
-            </Button>
-
-            <div className="relative animate-stagger-2">
-              <div className="absolute inset-0 flex items-center">
-                <span className="w-full border-t border-border/50" />
+            <div>
+              <Label htmlFor="studentGroup">กลุ่มเรียนของคุณ</Label>
+              <div className="flex gap-2">
+                <Select value={selectedGroup} onValueChange={handleSaveGroup}>
+                  <SelectTrigger className="bg-background">
+                    <SelectValue placeholder="เลือกกลุ่มเรียนของคุณ" />
+                  </SelectTrigger>
+                  <SelectContent className="bg-background z-50">
+                    {groups.map((group) => {
+                      const teacherNames = getGroupTeachers(group.id);
+                      return (
+                        <SelectItem key={group.id} value={group.id}>
+                          {group.name}
+                          {teacherNames && ` (อาจารย์${teacherNames})`}
+                          {" - "}
+                          {group.major} ชั้นปีที่ {group.year_level}
+                        </SelectItem>
+                      );
+                    })}
+                  </SelectContent>
+                </Select>
+                {isSavingProfile && <span className="text-sm text-muted-foreground">กำลังบันทึก...</span>}
               </div>
-              <div className="relative flex justify-center text-xs uppercase">
-                <span className="bg-card/80 backdrop-blur-sm px-3 py-1 rounded-full text-muted-foreground">หรือ</span>
-              </div>
+              {selectedGroup && (
+                <p className="text-sm text-muted-foreground mt-2">
+                  ✓ คุณอยู่กลุ่ม: {groups.find((g) => g.id === selectedGroup)?.name}
+                </p>
+              )}
+              {!selectedGroup && (
+                <p className="text-sm text-yellow-600 mt-2">⚠️ กรุณาเลือกกลุ่มเรียนของคุณก่อนอัปโหลดใบ Coaching</p>
+              )}
             </div>
+          </CardContent>
+        </Card>
 
-            <div className="grid grid-cols-2 gap-4 animate-stagger-3">
-              <div className="space-y-2">
-                <Label htmlFor="firstName" className="text-sm font-medium">ชื่อ</Label>
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-xl sm:text-2xl">ความคืบหน้า Coaching</CardTitle>
+            <CardDescription>
+              {completedSessions}/{requiredSessions} ครั้ง
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <Progress value={progressPercentage} className="h-3" />
+            <p className="text-center mt-2 text-sm">
+              {Math.round(progressPercentage)}% เสร็จสมบูรณ์
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-lg sm:text-xl">อัปโหลดใบ Coaching</CardTitle>
+            <CardDescription>
+              เลือกอาจารย์ที่ปรึกษาและอัปโหลดใบ Coaching (กลุ่มเรียนเป็นตัวเลือก)
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div>
+                <Label htmlFor="teacher">เลือกอาจารย์ที่ปรึกษา <span className="text-red-500">*</span></Label>
+                <Select value={selectedTeacher} onValueChange={setSelectedTeacher}>
+                  <SelectTrigger className="bg-background">
+                    <SelectValue placeholder="เลือกอาจารย์" />
+                  </SelectTrigger>
+                  <SelectContent className="bg-background z-50">
+                    {availableTeachers.length === 0 ? (
+                      <div className="p-2 text-sm text-muted-foreground">
+                        {selectedGroup ? "ไม่มีอาจารย์ในกลุ่มนี้" : "ไม่มีอาจารย์"}
+                      </div>
+                    ) : (
+                      availableTeachers.map((teacher: any) => (
+                        <SelectItem key={teacher.id} value={teacher.id}>
+                          {teacher.first_name} {teacher.last_name}
+                        </SelectItem>
+                      ))
+                    )}
+                  </SelectContent>
+                </Select>
+                {selectedGroup && (
+                  <p className="text-xs text-muted-foreground mt-1">
+                    แสดงอาจารย์จากกลุ่ม: {groups.find((g) => g.id === selectedGroup)?.name}
+                  </p>
+                )}
+                {!selectedGroup && (
+                  <p className="text-xs text-muted-foreground mt-1">
+                    แสดงอาจารย์ทั้งหมด (เลือกกลุ่มเพื่อกรองอาจารย์)
+                  </p>
+                )}
+              </div>
+              <div>
+                <Label htmlFor="sessionNumber">หมายเลขครั้งที่ <span className="text-red-500">*</span></Label>
                 <Input
-                  id="firstName"
-                  value={registerData.firstName}
-                  onChange={(e) => setRegisterData({ ...registerData, firstName: e.target.value })}
-                  className="apple-input"
-                  required
+                  id="sessionNumber"
+                  type="number"
+                  value={sessionNumber}
+                  onChange={(e) => setSessionNumber(e.target.value)}
+                  placeholder="เช่น 1, 2, 3..."
                 />
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="lastName" className="text-sm font-medium">นามสกุล</Label>
-                <Input
-                  id="lastName"
-                  value={registerData.lastName}
-                  onChange={(e) => setRegisterData({ ...registerData, lastName: e.target.value })}
-                  className="apple-input"
-                  required
+              <div>
+                <Label htmlFor="file">อัปโหลดไฟล์ PDF <span className="text-red-500">*</span></Label>
+                <Input 
+                  id="file" 
+                  type="file" 
+                  accept=".pdf" 
+                  onChange={(e) => e.target.files && setFile(e.target.files[0])}
                 />
               </div>
             </div>
-            <div className="space-y-2 animate-stagger-4">
-              <Label htmlFor="register-email" className="text-sm font-medium">อีเมล</Label>
-              <Input
-                id="register-email"
-                type="email"
-                placeholder="example@spumail.net"
-                value={registerData.email}
-                onChange={(e) => setRegisterData({ ...registerData, email: e.target.value })}
-                className="apple-input"
-                required
-              />
-              <p className="text-xs text-muted-foreground/80 animate-fade-in">
-                ระบบนี้เปิดให้ลงทะเบียนเฉพาะนักศึกษา (@spumail.net) เท่านั้น<br />
-                อาจารย์และ Staff กรุณาติดต่อ Super Admin เพื่อสร้างบัญชี
-              </p>
-            </div>
-            {registerData.email.endsWith("@spumail.net") && (
-              <div className="space-y-4 animate-fade-in-up">
-                <div className="space-y-2">
-                  <Label htmlFor="studentId" className="text-sm font-medium">รหัสนักศึกษา</Label>
-                  <Input
-                    id="studentId"
-                    value={registerData.studentId}
-                    onChange={(e) => setRegisterData({ ...registerData, studentId: e.target.value })}
-                    placeholder="รหัสนักศึกษา"
-                    className="apple-input"
-                    required
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="groupId" className="text-sm font-medium">กลุ่มเรียน</Label>
-                  <select
-                    id="groupId"
-                    className="w-full px-3 py-2 border border-input rounded-md bg-background apple-input"
-                    value={registerData.groupId}
-                    onChange={(e) => setRegisterData({ ...registerData, groupId: e.target.value })}
-                    required
-                  >
-                    <option value="">เลือกกลุ่มเรียน</option>
-                    {groups.map((group) => (
-                      <option key={group.id} value={group.id}>
-                        {group.name} - {group.major} ชั้นปีที่ {group.year_level}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-            )}
-            <div className="space-y-2 animate-stagger-5">
-              <Label htmlFor="register-password" className="text-sm font-medium">รหัสผ่าน</Label>
-              <Input
-                id="register-password"
-                type="password"
-                value={registerData.password}
-                onChange={(e) => setRegisterData({ ...registerData, password: e.target.value })}
-                className="apple-input"
-                required
-              />
-            </div>
-            <div className="space-y-2 animate-stagger-6">
-              <Label htmlFor="confirm-password" className="text-sm font-medium">ยืนยันรหัสผ่าน</Label>
-              <Input
-                id="confirm-password"
-                type="password"
-                value={registerData.confirmPassword}
-                onChange={(e) => setRegisterData({ ...registerData, confirmPassword: e.target.value })}
-                className="apple-input"
-                required
-              />
-            </div>
-            <Button type="submit" className="w-full apple-button-primary animate-stagger-7" disabled={isLoading}>
-              {isLoading ? "กำลังลงทะเบียน..." : "ลงทะเบียน"}
+            <Button onClick={handleUploadSession} disabled={isUploading} className="w-full sm:w-auto">
+              <Upload className="w-4 h-4 mr-2" />
+              {isUploading ? "กำลังอัปโหลด..." : "อัปโหลด"}
             </Button>
-          </form>
-        </TabsContent>
-      </Tabs>
-    </AuthLayout>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-lg sm:text-xl">ประวัติการส่ง</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>ครั้งที่</TableHead>
+                    <TableHead>วันที่ส่ง</TableHead>
+                    <TableHead>สถานะ</TableHead>
+                    <TableHead>ความคิดเห็น</TableHead>
+                    <TableHead>ไฟล์</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {sessions.map((session) => (
+                    <TableRow key={session.id}>
+                      <TableCell>#{session.session_number}</TableCell>
+                      <TableCell className="text-sm">{new Date(session.created_at).toLocaleDateString("th-TH")}</TableCell>
+                      <TableCell>{getStatusBadge(session.status)}</TableCell>
+                      <TableCell className="max-w-xs truncate text-sm">
+                        {session.teacher_comment || "-"}
+                      </TableCell>
+                      <TableCell>
+                        <Button variant="outline" size="sm" onClick={() => viewFile(session.file_url)}>
+                          <Download className="w-4 h-4" />
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </DashboardLayout>
   );
 }
